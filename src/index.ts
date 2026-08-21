@@ -17,20 +17,32 @@ app.get("/health", async () => {
 });
 
 const ORDER_ID_MAX = Number(process.env.ORDER_ID_MAX?.replace(/_/g, '') ?? 10_000);
+const l1Cache = new Map<string, { data: any, expiresAt: number }>();
 
 app.get("/order", async () => {
   const id = Math.floor(Math.random() * ORDER_ID_MAX) + 1;
   const cacheKey = `order:${id}`;
+  const now = Date.now();
 
+  // 1. L1 Cache (In-Memory)
+  const l1Hit = l1Cache.get(cacheKey);
+  if (l1Hit && l1Hit.expiresAt > now) {
+    return l1Hit.data;
+  }
+
+  // 2. L2 Cache (Redis)
   try {
     const cachedOrder = await redis.get(cacheKey);
     if (cachedOrder) {
-      return JSON.parse(cachedOrder);
+      const parsed = JSON.parse(cachedOrder);
+      l1Cache.set(cacheKey, { data: parsed, expiresAt: now + 60000 });
+      return parsed;
     }
   } catch (error) {
     console.warn(`Redis GET error for key ${cacheKey}:`, error);
   }
 
+  // 3. Database
   const order = await prisma.order.findFirst({
     where: {
       id,
@@ -38,6 +50,7 @@ app.get("/order", async () => {
   });
 
   if (order) {
+    l1Cache.set(cacheKey, { data: order, expiresAt: now + 60000 });
     try {
       await redis.setex(cacheKey, 60, JSON.stringify(order));
     } catch (error) {
@@ -48,6 +61,8 @@ app.get("/order", async () => {
   return order;
 });
 
+const localWriteBuffer: string[] = [];
+
 app.post("/order", async (req: any, res: any) => {
   const { userId, amount, status } = req.body;
   const payload = {
@@ -56,16 +71,23 @@ app.post("/order", async (req: any, res: any) => {
     ...(status && { status }),
   };
 
-  try {
-    await redis.rpush('orderQueue', JSON.stringify(payload));
-  } catch (error) {
-    console.warn('Redis queue push error, falling back to direct write:', error);
-    const order = await prisma.order.create({ data: payload });
-    return order;
-  }
-
+  localWriteBuffer.push(JSON.stringify(payload));
   return { status: "queued" };
 });
+
+const flushToRedis = async () => {
+  if (localWriteBuffer.length === 0) return;
+  const batch = localWriteBuffer.splice(0, localWriteBuffer.length);
+  try {
+    await redis.rpush('orderQueue', ...batch);
+  } catch (error) {
+    console.warn('Redis queue push error, falling back to direct write:', error);
+    const objects = batch.map(b => JSON.parse(b));
+    await prisma.order.createMany({ data: objects }).catch(e => console.error('Fallback DB write failed', e));
+  }
+};
+
+const redisFlusherInterval = setInterval(flushToRedis, 200);
 
 const flushQueue = async () => {
   try {
@@ -96,8 +118,10 @@ const flushQueue = async () => {
 const flusherInterval = setInterval(flushQueue, 5000);
 
 const shutdown = async () => {
-  console.log('Shutting down... flushing queue.');
+  console.log('Shutting down... flushing queues.');
+  clearInterval(redisFlusherInterval);
   clearInterval(flusherInterval);
+  await flushToRedis();
   await flushQueue();
   await prisma.$disconnect();
   redis.disconnect();

@@ -7,7 +7,7 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "tsx watch src/index.ts",
     "seed": "tsx prisma/seed.ts",
-    "auto:read": "npx autocannon -c 10 -d 30 -p 1 --renderStatusCodes http://localhost:3000/order",
+    "auto:read": "npx autocannon -c 50 -d 30 -p 1 --renderStatusCodes http://localhost:3000/order",
     "auto:write": "node autocannon/write.js"
   },
   "prisma": {
