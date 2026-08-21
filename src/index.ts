@@ -3,6 +3,27 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import "dotenv/config";
 import { PrismaClient } from "../generated/prisma/client";
 import Redis from 'ioredis';
+import fastJson from 'fast-json-stringify';
+
+const stringifyOrderPayload = fastJson({
+  type: 'object',
+  properties: {
+    userId: { type: 'integer' },
+    amount: { type: 'integer' },
+    status: { type: 'string' }
+  },
+  required: ['userId', 'amount']
+});
+
+const stringifyOrder = fastJson({
+  type: 'object',
+  properties: {
+    id: { type: 'integer' },
+    userId: { type: 'integer' },
+    amount: { type: 'integer' },
+    status: { type: 'string' }
+  }
+});
 
 const adapter = new PrismaPg({
   connectionString: process.env.DATABASE_URL,
@@ -19,7 +40,21 @@ app.get("/health", async () => {
 const ORDER_ID_MAX = Number(process.env.ORDER_ID_MAX?.replace(/_/g, '') ?? 10_000);
 const l1Cache = new Map<string, { data: any, expiresAt: number }>();
 
-app.get("/order", async () => {
+app.get("/order", {
+  schema: {
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer' },
+          userId: { type: 'integer' },
+          amount: { type: 'integer' },
+          status: { type: 'string', nullable: true }
+        }
+      }
+    }
+  }
+}, async () => {
   const id = Math.floor(Math.random() * ORDER_ID_MAX) + 1;
   const cacheKey = `order:${id}`;
   const now = Date.now();
@@ -52,7 +87,7 @@ app.get("/order", async () => {
   if (order) {
     l1Cache.set(cacheKey, { data: order, expiresAt: now + 60000 });
     try {
-      await redis.setex(cacheKey, 60, JSON.stringify(order));
+      await redis.setex(cacheKey, 60, stringifyOrder(order));
     } catch (error) {
       console.warn(`Redis SETEX error for key ${cacheKey}:`, error);
     }
@@ -63,7 +98,27 @@ app.get("/order", async () => {
 
 const localWriteBuffer: string[] = [];
 
-app.post("/order", async (req: any, res: any) => {
+app.post("/order", {
+  schema: {
+    body: {
+      type: 'object',
+      properties: {
+        userId: { type: 'integer' },
+        amount: { type: 'integer' },
+        status: { type: 'string', nullable: true }
+      },
+      required: ['userId', 'amount']
+    },
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          status: { type: 'string' }
+        }
+      }
+    }
+  }
+}, async (req: any, res: any) => {
   const { userId, amount, status } = req.body;
   const payload = {
     userId: parseInt(userId),
@@ -71,7 +126,7 @@ app.post("/order", async (req: any, res: any) => {
     ...(status && { status }),
   };
 
-  localWriteBuffer.push(JSON.stringify(payload));
+  localWriteBuffer.push(stringifyOrderPayload(payload));
   return { status: "queued" };
 });
 
